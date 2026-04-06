@@ -63,6 +63,7 @@ class Platform(Enum):
     WEBHOOK = "webhook"
     FEISHU = "feishu"
     WECOM = "wecom"
+    WECHAT = "wechat"
 
 
 @dataclass
@@ -246,6 +247,7 @@ class GatewayConfig:
 
     # Session isolation in shared chats
     group_sessions_per_user: bool = True  # Isolate group/channel sessions per participant when user IDs are available
+    thread_sessions_per_user: bool = False  # When False (default), threads are shared across all participants
 
     # Unauthorized DM policy
     unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
@@ -285,6 +287,9 @@ class GatewayConfig:
                 connected.append(platform)
             # WeCom uses extra dict for bot credentials
             elif platform == Platform.WECOM and config.extra.get("bot_id"):
+                connected.append(platform)
+            # WeChat uses enabled flag only (QR login handles auth)
+            elif platform == Platform.WECHAT:
                 connected.append(platform)
         return connected
     
@@ -333,6 +338,7 @@ class GatewayConfig:
             "always_log_local": self.always_log_local,
             "stt_enabled": self.stt_enabled,
             "group_sessions_per_user": self.group_sessions_per_user,
+            "thread_sessions_per_user": self.thread_sessions_per_user,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
         }
@@ -376,6 +382,7 @@ class GatewayConfig:
             stt_enabled = data.get("stt", {}).get("enabled") if isinstance(data.get("stt"), dict) else None
 
         group_sessions_per_user = data.get("group_sessions_per_user")
+        thread_sessions_per_user = data.get("thread_sessions_per_user")
         unauthorized_dm_behavior = _normalize_unauthorized_dm_behavior(
             data.get("unauthorized_dm_behavior"),
             "pair",
@@ -392,6 +399,7 @@ class GatewayConfig:
             always_log_local=data.get("always_log_local", True),
             stt_enabled=_coerce_bool(stt_enabled, True),
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
+            thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
         )
@@ -466,6 +474,9 @@ def load_gateway_config() -> GatewayConfig:
 
             if "group_sessions_per_user" in yaml_cfg:
                 gw_data["group_sessions_per_user"] = yaml_cfg["group_sessions_per_user"]
+
+            if "thread_sessions_per_user" in yaml_cfg:
+                gw_data["thread_sessions_per_user"] = yaml_cfg["thread_sessions_per_user"]
 
             streaming_cfg = yaml_cfg.get("streaming")
             if isinstance(streaming_cfg, dict):
@@ -575,6 +586,20 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["WHATSAPP_FREE_RESPONSE_CHATS"] = str(frc)
+
+            # Matrix settings → env vars (env vars take precedence)
+            matrix_cfg = yaml_cfg.get("matrix", {})
+            if isinstance(matrix_cfg, dict):
+                if "require_mention" in matrix_cfg and not os.getenv("MATRIX_REQUIRE_MENTION"):
+                    os.environ["MATRIX_REQUIRE_MENTION"] = str(matrix_cfg["require_mention"]).lower()
+                frc = matrix_cfg.get("free_response_rooms")
+                if frc is not None and not os.getenv("MATRIX_FREE_RESPONSE_ROOMS"):
+                    if isinstance(frc, list):
+                        frc = ",".join(str(v) for v in frc)
+                    os.environ["MATRIX_FREE_RESPONSE_ROOMS"] = str(frc)
+                if "auto_thread" in matrix_cfg and not os.getenv("MATRIX_AUTO_THREAD"):
+                    os.environ["MATRIX_AUTO_THREAD"] = str(matrix_cfg["auto_thread"]).lower()
+
     except Exception as e:
         logger.warning(
             "Failed to process config.yaml — falling back to .env / gateway.json values. "
@@ -901,6 +926,29 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 platform=Platform.WECOM,
                 chat_id=wecom_home,
                 name=os.getenv("WECOM_HOME_CHANNEL_NAME", "Home"),
+            )
+
+    # WeChat (Personal)
+    wechat_enabled = os.getenv("WECHAT_ENABLED", "").lower() in ("true", "1", "yes")
+    if wechat_enabled:
+        if Platform.WECHAT not in config.platforms:
+            config.platforms[Platform.WECHAT] = PlatformConfig()
+        config.platforms[Platform.WECHAT].enabled = True
+        wechat_api_base = os.getenv("WECHAT_API_BASE_URL", "")
+        if wechat_api_base:
+            config.platforms[Platform.WECHAT].extra["base_url"] = wechat_api_base
+        wechat_cdn_base = os.getenv("WECHAT_CDN_BASE_URL", "")
+        if wechat_cdn_base:
+            config.platforms[Platform.WECHAT].extra["cdn_base_url"] = wechat_cdn_base
+        wechat_account_id = os.getenv("WECHAT_ACCOUNT_ID", "")
+        if wechat_account_id:
+            config.platforms[Platform.WECHAT].extra["account_id"] = wechat_account_id
+        wechat_home = os.getenv("WECHAT_HOME_CHANNEL")
+        if wechat_home:
+            config.platforms[Platform.WECHAT].home_channel = HomeChannel(
+                platform=Platform.WECHAT,
+                chat_id=wechat_home,
+                name=os.getenv("WECHAT_HOME_CHANNEL_NAME", "Home"),
             )
 
     # Session settings
