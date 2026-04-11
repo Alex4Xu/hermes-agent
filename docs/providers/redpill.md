@@ -22,8 +22,8 @@ This matters for:
 
 | Provider | Encryption | Operator Access | Attestation |
 |----------|-----------|-----------------|-------------|
-| RedPill (TEE) | Hardware enclave | ❌ No | ✅ Yes |
-| OpenRouter/Nous | TLS + zero-retention policy | ✅ Technically possible | ❌ No |
+| RedPill (TEE) | Hardware enclave | No | Yes |
+| OpenRouter/Nous | TLS + zero-retention policy | Technically possible | No |
 | Self-hosted | Full control | N/A | N/A |
 
 RedPill is the middle ground: cloud convenience with near self-hosted privacy.
@@ -32,7 +32,7 @@ RedPill is the middle ground: cloud convenience with near self-hosted privacy.
 
 ```bash
 # Set your API key
-echo "REDPILL_API_KEY=your-key" >> ~/.hermes/.env
+echo "REDPILL_API_KEY=*** >> ~/.hermes/.env
 
 # Select RedPill
 hermes model  # Choose "RedPill (TEE-protected aggregator API)"
@@ -42,8 +42,8 @@ hermes model  # Choose "RedPill (TEE-protected aggregator API)"
 
 | Variable | Required | Default |
 |----------|----------|---------|
-| `REDPILL_API_KEY` | ✅ Yes | - |
-| `REDPILL_BASE_URL` | ❌ No | `https://api.redpill.ai/v1` |
+| `REDPILL_API_KEY` | Yes | - |
+| `REDPILL_BASE_URL` | No | `https://api.redpill.ai/v1` |
 
 ## Available Models
 
@@ -100,7 +100,7 @@ RedPill uses pay-per-token pricing. Check current rates at [redpill.ai/pricing](
 
 ```bash
 # Test connectivity
-curl -H "Authorization: Bearer $REDPILL_API_KEY" \
+curl -H "Authorization: Bearer *** \
   https://api.redpill.ai/v1/models
 ```
 
