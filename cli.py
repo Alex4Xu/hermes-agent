@@ -1585,6 +1585,19 @@ def _should_auto_attach_clipboard_image_on_paste(pasted_text: str) -> bool:
     return not pasted_text.strip()
 
 
+def _preprocess_user_message_shortcuts(text: str) -> str:
+    """Expand hard-coded user-input shortcuts before slash/file handling.
+
+    A single ASCII period is this user's durable shorthand for "continue".
+    Keep the match deliberately exact after trimming surrounding whitespace:
+    ".abc", "..", "...", Chinese full stop, and normal sentences must not
+    trigger continuation.
+    """
+    if isinstance(text, str) and text.strip() == ".":
+        return "继续上一任务。"
+    return text
+
+
 def _strip_leaked_bracketed_paste_wrappers(text: str) -> str:
     """Strip leaked bracketed-paste wrapper markers from user-visible text.
 
@@ -2031,6 +2044,15 @@ class HermesCLI:
         
         # streaming: stream tokens to the terminal as they arrive (display.streaming in config.yaml)
         self.streaming_enabled = CLI_CONFIG["display"].get("streaming", False)
+        try:
+            from tools.stealth_io_policy import is_output_filter_enabled
+            if is_output_filter_enabled() and self.streaming_enabled:
+                # Streaming prints tokens before final-response post-processing.
+                # Stealth output filtering requires a complete response buffer.
+                self.streaming_enabled = False
+                logger.info("stealth output_filter active; disabled token streaming for output containment")
+        except Exception:
+            pass
         self.final_response_markdown = str(
             CLI_CONFIG["display"].get("final_response_markdown", "strip")
         ).strip().lower() or "strip"
@@ -3233,6 +3255,32 @@ class HermesCLI:
         self._reasoning_preview_buf = ""
         self._deferred_content = ""
 
+    def _apply_stealth_output_filter(self, response: str) -> str:
+        """Apply stealth control-window output policy before local display."""
+        if not response:
+            return response
+        try:
+            from tools.stealth_io_policy import filter_output
+            filtered, meta = filter_output(response, audience="control")
+            if meta.get("enabled") and filtered != response:
+                logging.info(
+                    "stealth control output redacted secrets: redactions=%s",
+                    meta.get("redactions", 0),
+                )
+            return filtered
+        except Exception as exc:
+            logging.warning("stealth output_filter failed open: %s", exc)
+            return response
+
+    def _replace_last_assistant_response(self, response: str) -> None:
+        """Keep in-memory history aligned with a filtered final response."""
+        if not response or not isinstance(getattr(self, "conversation_history", None), list):
+            return
+        for msg in reversed(self.conversation_history):
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
+                msg["content"] = response
+                break
+
     def _slow_command_status(self, command: str) -> str:
         """Return a user-facing status message for slower slash commands."""
         cmd_lower = command.lower().strip()
@@ -3404,13 +3452,24 @@ class HermesCLI:
         self.api_key = api_key
         self.base_url = base_url
 
+        # Pin base_url and model after first resolution so external
+        # `hermes model` changes do NOT leak into running sessions.
+        # api_key intentionally stays dynamic for credential rotation.
+        if not getattr(self, "_runtime_pinned", False):
+            self._explicit_base_url = base_url
+            self._pinned_model = self.model
+            self._runtime_pinned = True
+        else:
+            self.base_url = self._explicit_base_url
+            self.model = getattr(self, "_pinned_model", self.model)
+
         # When a custom_provider entry carries an explicit `model` field,
         # use it as the effective model name.  Without this, running
         # `hermes chat --model <provider-name>` sends the provider name
         # (e.g. "my-provider") as the model string to the API instead of
         # the configured model (e.g. "qwen3.6-plus"), causing 400 errors.
         runtime_model = runtime.get("model")
-        if runtime_model and isinstance(runtime_model, str):
+        if runtime_model and isinstance(runtime_model, str) and not getattr(self, "_runtime_pinned", False):
             # Only use runtime model if: model is unset, or model equals provider name
             should_use_runtime_model = (
                 not self.model or  # No model configured yet
@@ -5473,6 +5532,11 @@ class HermesCLI:
         if result.api_mode:
             self.api_mode = result.api_mode
 
+        # Re-pin so _ensure_runtime_credentials keeps this session-local
+        # switch stable even if config.yaml is changed externally later.
+        self._pinned_model = self.model
+        self._runtime_pinned = True
+
         if self.agent is not None:
             try:
                 self.agent.switch_model(
@@ -6292,6 +6356,8 @@ class HermesCLI:
             self.show_help()
         elif canonical == "profile":
             self._handle_profile_command()
+        elif canonical == "stealth":
+            self._handle_stealth_command(cmd_original)
         elif canonical == "tools":
             self._handle_tools_command(cmd_original)
         elif canonical == "toolsets":
@@ -6684,6 +6750,432 @@ class HermesCLI:
                     _cprint(f"{_DIM}{_ACCENT}Type /help for available commands{_RST}")
         
         return True
+
+    def _handle_stealth_command(self, cmd: str):
+        """Handle /stealth — non-destructive entry/status/audit for the isolated profile."""
+        try:
+            from hermes_constants import get_default_hermes_root, get_hermes_home
+            from hermes_cli.profiles import get_profile_dir
+        except Exception as exc:
+            _cprint(f"  Stealth unavailable: failed to load profile helpers: {exc}")
+            return
+
+        parts = cmd.strip().split(maxsplit=1)
+        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+        root = get_default_hermes_root()
+        current_home = get_hermes_home().resolve()
+        stealth_home = get_profile_dir("stealth").resolve()
+
+        if current_home == root.resolve():
+            current_profile = "default"
+        elif current_home.parent.name == "profiles":
+            current_profile = current_home.name
+        else:
+            current_profile = str(current_home)
+
+        def _read_yaml(path: Path) -> dict:
+            try:
+                if path.exists():
+                    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            except Exception:
+                return {}
+            return {}
+
+        def _stealth_summary():
+            cfg = _read_yaml(stealth_home / "config.yaml")
+            model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+            aux = cfg.get("auxiliary") if isinstance(cfg.get("auxiliary"), dict) else {}
+            mem_dir = stealth_home / "memories"
+            print("  STEALTH profile")
+            print(f"  home: {stealth_home}")
+            print(f"  current profile: {current_profile}")
+            print(f"  model: {model_cfg.get('default') or model_cfg.get('model') or '—'}")
+            print(f"  provider: {model_cfg.get('provider') or '—'}")
+            fallbacks = cfg.get('fallback_providers') or []
+            print(f"  fallback count: {len(fallbacks)}")
+            if fallbacks:
+                print("  fallbacks:")
+                for fb in fallbacks:
+                    if isinstance(fb, dict):
+                        print(f"    {fb.get('provider') or '—'} / {fb.get('model') or '—'}")
+            print(f"  memory dir: {mem_dir}")
+            print(f"  MEMORY.md: {'yes' if (mem_dir / 'MEMORY.md').exists() else 'no'}")
+            print(f"  USER.md: {'yes' if (mem_dir / 'USER.md').exists() else 'no'}")
+            if aux:
+                print("  auxiliary:")
+                for key in sorted(aux):
+                    val = aux.get(key)
+                    if isinstance(val, dict):
+                        print(f"    {key}: {val.get('provider') or '—'} / {val.get('model') or '—'}")
+
+        if arg in ("status", "") and current_home == stealth_home:
+            _stealth_summary()
+            return
+
+        if arg == "status":
+            _stealth_summary()
+            if current_home != stealth_home:
+                print("  Not currently inside stealth. Run `stealth` in a new terminal to enter without touching this session.")
+            return
+
+        if arg.startswith("audit"):
+            audit_flags = set(arg.split()[1:])
+            unknown_flags = audit_flags - {"--live", "--smoke"}
+            if unknown_flags:
+                print("  Usage: /stealth audit [--live] [--smoke]")
+                print(f"  Unknown audit flag(s): {', '.join(sorted(unknown_flags))}")
+                return
+            do_live = "--live" in audit_flags
+            do_smoke = "--smoke" in audit_flags
+            if do_smoke and not do_live:
+                print("  Usage: /stealth audit --live [--smoke]")
+                print("  --smoke requires --live")
+                return
+
+            cfg = _read_yaml(stealth_home / "config.yaml")
+            issues = []
+            warnings = []
+            notes = []
+            model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+            if (model_cfg.get("default") or model_cfg.get("model")) != "z-ai/glm-5.1":
+                issues.append("main model is not z-ai/glm-5.1")
+            if model_cfg.get("provider") != "custom":
+                issues.append("main provider is not custom RedPill route")
+            fallbacks = cfg.get("fallback_providers") or []
+            allowed_fallbacks = {"moonshotai/kimi-k2.6", "deepseek/deepseek-v3.2"}
+            for i, fb in enumerate(fallbacks):
+                if not isinstance(fb, dict):
+                    issues.append(f"fallback {i} is not a mapping")
+                    continue
+                if fb.get("provider") != "custom":
+                    issues.append(f"fallback {i} provider is {fb.get('provider')!r}, not custom RedPill route")
+                if fb.get("base_url") != "https://api.redpill.ai/v1":
+                    issues.append(f"fallback {i} base_url is not RedPill")
+                if fb.get("model") not in allowed_fallbacks:
+                    issues.append(f"fallback {i} model {fb.get('model')!r} is not in approved RedPill fallback set")
+            aux = cfg.get("auxiliary") if isinstance(cfg.get("auxiliary"), dict) else {}
+            for key, val in aux.items():
+                if isinstance(val, dict) and (val.get("provider") not in ("RedPill", "redpill")):
+                    issues.append(f"auxiliary.{key} provider is {val.get('provider')!r}, not RedPill")
+            try:
+                from toolsets import resolve_toolset
+                toolsets = cfg.get("platform_toolsets", {}).get("cli", [])
+                tools = []
+                for name in toolsets:
+                    tools.extend(resolve_toolset(name))
+                tools = set(tools)
+                hard_blocked = (
+                    "send_message", "cronjob", "image_generate", "text_to_speech", "delegate_task",
+                    "browser_click", "browser_type", "browser_press", "browser_dialog",
+                    "browser_console", "browser_cdp",
+                )
+                for blocked in hard_blocked:
+                    if blocked in tools:
+                        issues.append(f"blocked tool present: {blocked}")
+
+                high_power_tools = sorted(tools.intersection({
+                    "terminal", "process", "execute_code", "write_file", "patch", "web_search", "web_extract"
+                }))
+                _sec_for_tools = cfg.get("security") if isinstance(cfg.get("security"), dict) else {}
+                _egress_for_tools = _sec_for_tools.get("egress_guard") if isinstance(_sec_for_tools.get("egress_guard"), dict) else {}
+                if high_power_tools and _egress_for_tools.get("enabled") is True:
+                    notes.append("high-power tools enabled with stealth egress guard active: " + ", ".join(high_power_tools))
+                elif high_power_tools:
+                    warnings.append("high-power tools enabled without a runtime guard: " + ", ".join(high_power_tools))
+                if "browser_readonly" in toolsets:
+                    notes.append("browser_readonly enabled: observe-only browser tools are present; interactive browser tools are absent")
+            except Exception as exc:
+                issues.append(f"toolset audit failed: {exc}")
+
+            security_cfg = cfg.get("security") if isinstance(cfg.get("security"), dict) else {}
+            web_cfg = cfg.get("web") if isinstance(cfg.get("web"), dict) else {}
+            browser_cfg = cfg.get("browser") if isinstance(cfg.get("browser"), dict) else {}
+            display_cfg = cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
+            terminal_cfg = cfg.get("terminal") if isinstance(cfg.get("terminal"), dict) else {}
+            sessions_cfg = cfg.get("sessions") if isinstance(cfg.get("sessions"), dict) else {}
+
+            if security_cfg.get("redact_secrets") is not True:
+                warnings.append("security.redact_secrets is not enabled")
+            privacy_cfg = cfg.get("privacy") if isinstance(cfg.get("privacy"), dict) else {}
+            if privacy_cfg.get("redact_pii") is not True:
+                warnings.append("privacy.redact_pii is not enabled")
+            if security_cfg.get("allow_private_urls") is not False:
+                warnings.append("security.allow_private_urls is not false")
+            if browser_cfg.get("allow_private_urls") is not False:
+                warnings.append("browser.allow_private_urls is not false")
+
+            if not (isinstance(security_cfg.get("egress_guard"), dict) and security_cfg.get("egress_guard", {}).get("enabled") is True):
+                warnings.append("no enforced egress guard configured; terminal/execute_code can still initiate outbound network traffic")
+            else:
+                notes.append("egress_guard enabled: terminal/execute_code outbound write patterns are blocked at tool layer")
+            if not (isinstance(security_cfg.get("output_filter"), dict) and security_cfg.get("output_filter", {}).get("enabled") is True):
+                warnings.append("no enforced output filter configured; non-disclosure rules still depend on model compliance")
+            else:
+                notes.append("output_filter enabled: final assistant responses redact operational details before display")
+                if display_cfg.get("streaming") is True:
+                    warnings.append("display.streaming is true; token streaming can bypass final-response output_filter")
+
+            memory_guard_cfg = security_cfg.get("memory_guard") if isinstance(security_cfg.get("memory_guard"), dict) else {}
+            if memory_guard_cfg.get("enabled") is True:
+                notes.append("memory_guard enabled: durable memory writes are source-aware and injection-scanned")
+            else:
+                warnings.append("no memory_guard configured; external/tool content could persist through durable memory")
+
+            file_write_guard_cfg = security_cfg.get("file_write_guard") if isinstance(security_cfg.get("file_write_guard"), dict) else {}
+            if file_write_guard_cfg.get("enabled") is True:
+                notes.append("file_write_guard enabled: local writes are constrained to stealth-approved roots")
+            else:
+                warnings.append("no file_write_guard configured; write_file/patch can modify paths outside stealth workdir")
+
+            tool_decision_audit_cfg = security_cfg.get("tool_decision_audit") if isinstance(security_cfg.get("tool_decision_audit"), dict) else {}
+            if tool_decision_audit_cfg.get("enabled") is True:
+                notes.append("tool_decision_audit enabled: allowed/blocked tool policy decisions are hash-audited locally")
+            else:
+                warnings.append("no tool_decision_audit configured; policy decisions are not consistently replayable")
+            if web_cfg.get("backend") and web_cfg.get("backend") != "local":
+                wqa_cfg = security_cfg.get("web_query_audit") if isinstance(security_cfg.get("web_query_audit"), dict) else {}
+                if wqa_cfg.get("enabled") is True:
+                    notes.append(f"web backend is {web_cfg.get('backend')!r}; external search intent is hash-audited locally")
+                else:
+                    warnings.append(f"web backend is {web_cfg.get('backend')!r}; search intent leaves the local machine")
+            runtime_fields = display_cfg.get("runtime_footer", {}).get("fields", []) if isinstance(display_cfg.get("runtime_footer"), dict) else []
+            exposed_footer = sorted(set(runtime_fields).intersection({"model", "cwd", "provider", "tools", "profile"}))
+            if exposed_footer:
+                warnings.append("runtime footer may expose operational metadata: " + ", ".join(exposed_footer))
+            if terminal_cfg.get("persistent_shell") is True:
+                warnings.append("terminal.persistent_shell is true; shell state can persist across commands")
+            if sessions_cfg.get("auto_prune") is not True:
+                warnings.append("sessions.auto_prune is not enabled; stealth transcripts may accumulate")
+
+            try:
+                workdir = Path(str(terminal_cfg.get("cwd") or stealth_home))
+                if workdir.exists():
+                    visible_items = [p for p in workdir.iterdir() if p.name not in (".", "..")]
+                    if not visible_items:
+                        notes.append(f"workdir is empty: {workdir}")
+                else:
+                    warnings.append(f"workdir does not exist: {workdir}")
+            except Exception as exc:
+                warnings.append(f"workdir audit failed: {exc}")
+
+            try:
+                skill_root = stealth_home / "skills"
+                skill_files = list(skill_root.glob("**/SKILL.md")) if skill_root.exists() else []
+                category_names = sorted({p.relative_to(skill_root).parts[0] for p in skill_files if len(p.relative_to(skill_root).parts) > 1})
+                noisy_categories = sorted(set(category_names).intersection({"social-media", "email", "gaming", "red-teaming", "apple", "github", "mcp"}))
+                notes.append(f"skills inventory: {len(skill_files)} skills across {len(category_names)} categories")
+                if noisy_categories:
+                    warnings.append("broad skill surface present in stealth profile: " + ", ".join(noisy_categories))
+            except Exception as exc:
+                warnings.append(f"skills inventory audit failed: {exc}")
+
+            live_results = []
+            if do_live:
+                import urllib.error
+                import urllib.parse
+                import urllib.request
+
+                def _read_env_key(env_path: Path, key: str) -> str | None:
+                    try:
+                        if not env_path.exists():
+                            return None
+                        for raw in env_path.read_text(encoding="utf-8").splitlines():
+                            line = raw.strip()
+                            if not line or line.startswith("#") or "=" not in line:
+                                continue
+                            name, value = line.split("=", 1)
+                            if name.strip() == key:
+                                value = value.strip().strip('"').strip("'")
+                                return value or None
+                    except Exception:
+                        return None
+                    return None
+
+                def _redpill_get(path: str, api_key: str | None, timeout: int = 20):
+                    url = "https://api.redpill.ai/v1" + path
+                    req = urllib.request.Request(url, method="GET")
+                    req.add_header("Accept", "application/json")
+                    if api_key:
+                        req.add_header("Authorization", f"Bearer {api_key}")
+                    try:
+                        with urllib.request.urlopen(req, timeout=timeout) as resp:
+                            body = resp.read().decode("utf-8", errors="replace")
+                            try:
+                                data = json.loads(body) if body else None
+                            except Exception:
+                                data = {"raw": body[:1000]}
+                            return resp.status, data, None
+                    except urllib.error.HTTPError as exc:
+                        body = exc.read().decode("utf-8", errors="replace")[:1000]
+                        return exc.code, None, body
+                    except Exception as exc:
+                        return None, None, str(exc)
+
+                def _collect_models(obj) -> set[str]:
+                    found = set()
+                    if isinstance(obj, dict):
+                        data = obj.get("data")
+                        if isinstance(data, list):
+                            for item in data:
+                                if isinstance(item, dict) and item.get("id"):
+                                    found.add(str(item.get("id")))
+                                elif isinstance(item, str):
+                                    found.add(item)
+                        for key in ("models", "items"):
+                            val = obj.get(key)
+                            if isinstance(val, list):
+                                for item in val:
+                                    if isinstance(item, dict) and item.get("id"):
+                                        found.add(str(item.get("id")))
+                                    elif isinstance(item, str):
+                                        found.add(item)
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            if isinstance(item, dict) and item.get("id"):
+                                found.add(str(item.get("id")))
+                            elif isinstance(item, str):
+                                found.add(item)
+                    return found
+
+                api_key = _read_env_key(stealth_home / ".env", "REDPILL_API_KEY") or _read_env_key(root / ".env", "REDPILL_API_KEY")
+                if api_key:
+                    live_results.append("REDPILL_API_KEY: present (value hidden)")
+                else:
+                    live_results.append("REDPILL_API_KEY: missing")
+                    issues.append("live audit cannot authenticate to RedPill: REDPILL_API_KEY missing")
+
+                required_models = set()
+                main_model = model_cfg.get("default") or model_cfg.get("model")
+                if main_model:
+                    required_models.add(main_model)
+                for fb in fallbacks:
+                    if isinstance(fb, dict) and fb.get("model"):
+                        required_models.add(str(fb.get("model")))
+                for val in aux.values():
+                    if isinstance(val, dict) and val.get("model"):
+                        required_models.add(str(val.get("model")))
+
+                status, models_data, err = _redpill_get("/models", api_key)
+                if status == 200:
+                    available = _collect_models(models_data)
+                    live_results.append(f"/models: HTTP 200, discovered {len(available)} model ids")
+                    missing = sorted(m for m in required_models if m not in available)
+                    if missing:
+                        issues.append("RedPill /models missing required model(s): " + ", ".join(missing))
+                    else:
+                        live_results.append("required models: all present in /models")
+                else:
+                    issues.append(f"RedPill /models check failed: HTTP/status {status or 'n/a'} {err or ''}".strip())
+
+                attested = []
+                attestation_models = sorted(required_models)
+                for model_name in attestation_models:
+                    att_path = "/attestation/report?model=" + urllib.parse.quote(model_name, safe="")
+                    att_status, att_data, att_err = _redpill_get(att_path, api_key, timeout=60)
+                    if att_status == 200:
+                        if isinstance(att_data, dict):
+                            att_type = att_data.get("attestation_type") or att_data.get("type") or "report"
+                            instances = att_data.get("all_attestations")
+                            count = len(instances) if isinstance(instances, list) else None
+                            attested.append(model_name)
+                            live_results.append(f"attestation {model_name}: HTTP 200, type={att_type}" + (f", instances={count}" if count is not None else ""))
+                        else:
+                            attested.append(model_name)
+                            live_results.append(f"attestation {model_name}: HTTP 200")
+                    else:
+                        issues.append(f"RedPill attestation check failed for {model_name}: HTTP/status {att_status or 'n/a'} {att_err or ''}".strip())
+                if attestation_models and len(attested) == len(attestation_models):
+                    live_results.append("attestation: all required models returned reports")
+
+                if do_smoke and api_key:
+                    payload = json.dumps({
+                        "model": main_model or "z-ai/glm-5.1",
+                        "messages": [{"role": "user", "content": "只回复 OK"}],
+                        "max_tokens": 8,
+                        "temperature": 0,
+                    }).encode("utf-8")
+                    req = urllib.request.Request("https://api.redpill.ai/v1/chat/completions", data=payload, method="POST")
+                    req.add_header("Content-Type", "application/json")
+                    req.add_header("Accept", "application/json")
+                    req.add_header("Authorization", f"Bearer {api_key}")
+                    try:
+                        with urllib.request.urlopen(req, timeout=30) as resp:
+                            body = resp.read().decode("utf-8", errors="replace")
+                            data = json.loads(body) if body else {}
+                            request_id = data.get("id") if isinstance(data, dict) else None
+                            live_results.append(f"smoke chat: HTTP {resp.status}" + (f", request_id={request_id}" if request_id else ""))
+                    except urllib.error.HTTPError as exc:
+                        body = exc.read().decode("utf-8", errors="replace")[:1000]
+                        issues.append(f"RedPill smoke chat failed: HTTP {exc.code} {body}")
+                    except Exception as exc:
+                        issues.append(f"RedPill smoke chat failed: {exc}")
+
+            print("  STEALTH audit" + (" --live" if do_live else "") + (" --smoke" if do_smoke else ""))
+            if live_results:
+                print("  Live checks:")
+                for item in live_results:
+                    print(f"    - {item}")
+            if issues:
+                print("  Critical issues:")
+                for item in issues:
+                    print(f"    - {item}")
+            if warnings:
+                print("  Warnings:")
+                for item in warnings:
+                    print(f"    - {item}")
+            if notes:
+                print("  Notes:")
+                for item in notes:
+                    print(f"    - {item}")
+            if issues:
+                print("  RESULT: FAIL — fix critical issues before trusting stealth mode.")
+            elif warnings:
+                print("  RESULT: PASS WITH WARNINGS — privacy model route is constrained, but stealth enforcement is incomplete.")
+            else:
+                print("  RESULT: PASS — model route, tool surface, and stealth controls match the current audit policy.")
+            return
+
+        def _exec_hermes(args: list[str]) -> None:
+            """Replace this CLI process with a fresh Hermes invocation."""
+            try:
+                from hermes_cli.relaunch import resolve_hermes_bin
+                bin_path = resolve_hermes_bin()
+            except Exception:
+                bin_path = None
+            if bin_path:
+                argv = [bin_path, *args]
+            else:
+                argv = [sys.executable, "-m", "hermes_cli.main", *args]
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
+            os.execvp(argv[0], argv)
+
+        if arg == "exit":
+            if current_home == stealth_home:
+                print("  Leaving stealth and returning to default profile in this terminal…")
+                _exec_hermes(["--profile", "default"])
+            else:
+                print(f"  Current profile is {current_profile}; no stealth session is active here.")
+            return
+
+        if arg:
+            print("  Usage: /stealth [status|audit [--live] [--smoke]|exit]")
+            return
+
+        if not stealth_home.is_dir():
+            print("  Stealth profile is missing. Create it first: hermes profile create stealth")
+            return
+
+        if current_home == stealth_home:
+            _stealth_summary()
+            return
+
+        print("  Entering stealth profile in this terminal…")
+        print("  Current session will not be carried into stealth; sticky default profile is unchanged.")
+        _exec_hermes(["--profile", "stealth"])
     
     def _handle_background_command(self, cmd: str):
         """Handle /background <prompt> — run a prompt in a separate background session.
@@ -6769,6 +7261,8 @@ class HermesCLI:
                 response = result.get("final_response", "") if result else ""
                 if not response and result and result.get("error"):
                     response = f"Error: {result['error']}"
+                if response:
+                    response = self._apply_stealth_output_filter(response)
 
                 # Display result in the CLI (thread-safe via patch_stdout).
                 # Force a TUI refresh first so spinner/status bar don't overlap
@@ -9032,6 +9526,9 @@ class HermesCLI:
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
 
+        if isinstance(message, str):
+            message = _preprocess_user_message_shortcuts(message)
+
         # Refresh provider credentials if needed (handles key rotation transparently)
         if not self._ensure_runtime_credentials():
             return None
@@ -9411,6 +9908,11 @@ class HermesCLI:
 
             # Get the final response
             response = result.get("final_response", "") if result else ""
+            if response:
+                response = self._apply_stealth_output_filter(response)
+                if result is not None:
+                    result["final_response"] = response
+                self._replace_last_assistant_response(response)
 
             # Auto-generate session title after first exchange (non-blocking)
             if response and result and not result.get("failed") and not result.get("partial"):
@@ -9460,6 +9962,14 @@ class HermesCLI:
                 # Add indicator that we were interrupted
                 if response and pending_message:
                     response = response + "\n\n---\n_[Interrupted - processing new message]_"
+
+            if response:
+                filtered_response = self._apply_stealth_output_filter(response)
+                if filtered_response != response:
+                    response = filtered_response
+                    if result is not None:
+                        result["final_response"] = response
+                    self._replace_last_assistant_response(response)
 
             response_previewed = result.get("response_previewed", False) if result else False
 
@@ -11492,6 +12002,7 @@ class HermesCLI:
                         user_input, _had_mouse_reports = _strip_leaked_terminal_responses_with_meta(user_input)
                         if _had_mouse_reports:
                             self._recover_terminal_input_modes(reason="mouse reports leaked into submitted input")
+                        user_input = _preprocess_user_message_shortcuts(user_input)
                     
                     # Check for commands — but detect dragged/pasted file paths first.
                     # See _detect_file_drop() for details.

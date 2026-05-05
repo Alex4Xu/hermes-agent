@@ -467,6 +467,7 @@ def memory_tool(
     target: str = "memory",
     content: str = None,
     old_text: str = None,
+    source_layer: str = "trusted_user_control",
     store: Optional[MemoryStore] = None,
 ) -> str:
     """
@@ -483,6 +484,24 @@ def memory_tool(
     if action == "add":
         if not content:
             return tool_error("Content is required for 'add' action.", success=False)
+        try:
+            from tools.stealth_memory_policy import check_memory_write, blocked_json
+            _decision = check_memory_write(action="add", target=target, content=content, source_layer=source_layer)
+            if not _decision.get("allowed", True):
+                return blocked_json(_decision)
+        except Exception as exc:
+            home = os.environ.get("HERMES_HOME", "")
+            norm_home = os.path.normpath(os.path.expanduser(home)) if home else ""
+            if os.path.basename(norm_home) == "stealth" and os.path.basename(os.path.dirname(norm_home)) == "profiles":
+                logger.error("stealth memory policy failed closed: %s", exc, exc_info=True)
+                return json.dumps({
+                    "success": False,
+                    "status": "blocked",
+                    "policy": "stealth_guard_fail_closed",
+                    "error": "STEALTH GUARD FAIL-CLOSED: memory safety guard failed; operation was not executed.",
+                    "reason": str(exc),
+                }, ensure_ascii=False)
+            logger.warning("stealth memory policy failed open outside stealth profile: %s", exc)
         result = store.add(target, content)
 
     elif action == "replace":
@@ -490,6 +509,24 @@ def memory_tool(
             return tool_error("old_text is required for 'replace' action.", success=False)
         if not content:
             return tool_error("content is required for 'replace' action.", success=False)
+        try:
+            from tools.stealth_memory_policy import check_memory_write, blocked_json
+            _decision = check_memory_write(action="replace", target=target, content=content, source_layer=source_layer)
+            if not _decision.get("allowed", True):
+                return blocked_json(_decision)
+        except Exception as exc:
+            home = os.environ.get("HERMES_HOME", "")
+            norm_home = os.path.normpath(os.path.expanduser(home)) if home else ""
+            if os.path.basename(norm_home) == "stealth" and os.path.basename(os.path.dirname(norm_home)) == "profiles":
+                logger.error("stealth memory policy failed closed: %s", exc, exc_info=True)
+                return json.dumps({
+                    "success": False,
+                    "status": "blocked",
+                    "policy": "stealth_guard_fail_closed",
+                    "error": "STEALTH GUARD FAIL-CLOSED: memory safety guard failed; operation was not executed.",
+                    "reason": str(exc),
+                }, ensure_ascii=False)
+            logger.warning("stealth memory policy failed open outside stealth profile: %s", exc)
         result = store.replace(target, old_text, content)
 
     elif action == "remove":
@@ -558,6 +595,11 @@ MEMORY_SCHEMA = {
                 "type": "string",
                 "description": "Short unique substring identifying the entry to replace or remove."
             },
+            "source_layer": {
+                "type": "string",
+                "enum": ["trusted_user_control", "trusted_local", "local_imported_unknown", "external_observed", "adversarial_or_probe", "memory_recalled", "tool_output"],
+                "description": "Optional provenance for the content. In stealth mode, external/tool/memory-recalled content cannot be written durably without user confirmation. Defaults to trusted_user_control for direct user requests."
+            },
         },
         "required": ["action", "target"],
     },
@@ -576,6 +618,7 @@ registry.register(
         target=args.get("target", "memory"),
         content=args.get("content"),
         old_text=args.get("old_text"),
+        source_layer=args.get("source_layer", "trusted_user_control"),
         store=kw.get("store")),
     check_fn=check_memory_requirements,
     emoji="🧠",

@@ -792,6 +792,25 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
 
 def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
     """Write content to a file."""
+    try:
+        from tools.stealth_io_policy import check_file_write_path, blocked_file_json
+        _stealth_file_decision = check_file_write_path(path, tool="write_file")
+        if not _stealth_file_decision.get("allowed", True):
+            return blocked_file_json(_stealth_file_decision, tool="write_file")
+    except Exception as _stealth_file_exc:
+        home = os.environ.get("HERMES_HOME", "")
+        norm_home = os.path.normpath(os.path.expanduser(home)) if home else ""
+        if os.path.basename(norm_home) == "stealth" and os.path.basename(os.path.dirname(norm_home)) == "profiles":
+            logger.error("stealth file write guard failed closed: %s", _stealth_file_exc, exc_info=True)
+            return json.dumps({
+                "success": False,
+                "error": "STEALTH GUARD FAIL-CLOSED: file write safety guard failed; operation was not executed.",
+                "status": "blocked",
+                "policy": "stealth_guard_fail_closed",
+                "tool": "write_file",
+                "reason": str(_stealth_file_exc),
+            }, ensure_ascii=False)
+        logger.warning("stealth file write guard failed open outside stealth profile: %s", _stealth_file_exc)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -860,6 +879,25 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         for _m in _re.finditer(r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
             _paths_to_check.append(_m.group(1).strip())
     for _p in _paths_to_check:
+        try:
+            from tools.stealth_io_policy import check_file_write_path, blocked_file_json
+            _stealth_file_decision = check_file_write_path(_p, tool="patch")
+            if not _stealth_file_decision.get("allowed", True):
+                return blocked_file_json(_stealth_file_decision, tool="patch")
+        except Exception as _stealth_file_exc:
+            home = os.environ.get("HERMES_HOME", "")
+            norm_home = os.path.normpath(os.path.expanduser(home)) if home else ""
+            if os.path.basename(norm_home) == "stealth" and os.path.basename(os.path.dirname(norm_home)) == "profiles":
+                logger.error("stealth file write guard failed closed: %s", _stealth_file_exc, exc_info=True)
+                return json.dumps({
+                    "success": False,
+                    "error": "STEALTH GUARD FAIL-CLOSED: patch safety guard failed; operation was not executed.",
+                    "status": "blocked",
+                    "policy": "stealth_guard_fail_closed",
+                    "tool": "patch",
+                    "reason": str(_stealth_file_exc),
+                }, ensure_ascii=False)
+            logger.warning("stealth file write guard failed open outside stealth profile: %s", _stealth_file_exc)
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)

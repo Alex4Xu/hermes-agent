@@ -1683,6 +1683,30 @@ def terminal_tool(
         config = _get_env_config()
         env_type = config["env_type"]
 
+        # Stealth profile I/O policy: allow broad read-only ingress, but block
+        # likely outbound writes/uploads from shell commands. This reports back
+        # through the control terminal instead of silently failing.
+        try:
+            from tools.stealth_io_policy import check_terminal_command, blocked_json
+            _stealth_decision = check_terminal_command(command)
+            if not _stealth_decision.get("allowed", True):
+                return blocked_json(_stealth_decision, tool="terminal")
+        except Exception as _stealth_guard_exc:
+            home = os.environ.get("HERMES_HOME", "")
+            norm_home = os.path.normpath(os.path.expanduser(home)) if home else ""
+            if os.path.basename(norm_home) == "stealth" and os.path.basename(os.path.dirname(norm_home)) == "profiles":
+                logger.error("stealth I/O policy guard failed closed: %s", _stealth_guard_exc, exc_info=True)
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": "STEALTH GUARD FAIL-CLOSED: terminal safety guard failed; operation was not executed.",
+                    "status": "blocked",
+                    "policy": "stealth_guard_fail_closed",
+                    "tool": "terminal",
+                    "reason": str(_stealth_guard_exc),
+                }, ensure_ascii=False)
+            logger.warning("stealth I/O policy guard failed open outside stealth profile: %s", _stealth_guard_exc)
+
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
         # every delegate_task child share one container; only task_ids with

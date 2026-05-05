@@ -132,6 +132,16 @@ TOOLSETS = {
         "includes": []
     },
     
+
+    "browser_readonly": {
+        "description": "Read-only browser observation: navigate, snapshot, scroll, back, get images, and browser vision; no clicking, typing, keypresses, dialogs, console, or CDP",
+        "tools": [
+            "browser_navigate", "browser_snapshot", "browser_scroll",
+            "browser_back", "browser_get_images", "browser_vision",
+            "web_search"
+        ],
+        "includes": []
+    },
     "cronjob": {
         "description": "Cronjob management tool - create, list, update, pause, resume, remove, and trigger scheduled tasks",
         "tools": ["cronjob"],

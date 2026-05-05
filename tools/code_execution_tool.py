@@ -960,6 +960,29 @@ def execute_code(
     if not code or not code.strip():
         return tool_error("No code provided.")
 
+    # Stealth profile I/O policy: execute_code is allowed for local analysis
+    # and RPC-backed read-only ingress, but direct network write code is blocked.
+    try:
+        from tools.stealth_io_policy import check_code, blocked_json
+        _stealth_decision = check_code(code)
+        if not _stealth_decision.get("allowed", True):
+            return blocked_json(_stealth_decision, tool="execute_code")
+    except Exception as _stealth_guard_exc:
+        home = os.environ.get("HERMES_HOME", "")
+        norm_home = os.path.normpath(os.path.expanduser(home)) if home else ""
+        if os.path.basename(norm_home) == "stealth" and os.path.basename(os.path.dirname(norm_home)) == "profiles":
+            logger.error("stealth I/O policy guard failed closed in execute_code: %s", _stealth_guard_exc, exc_info=True)
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": "STEALTH GUARD FAIL-CLOSED: execute_code safety guard failed; operation was not executed.",
+                "status": "blocked",
+                "policy": "stealth_guard_fail_closed",
+                "tool": "execute_code",
+                "reason": str(_stealth_guard_exc),
+            }, ensure_ascii=False)
+        logger.warning("stealth I/O policy guard failed open outside stealth profile in execute_code: %s", _stealth_guard_exc)
+
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config
     env_type = _get_env_config()["env_type"]

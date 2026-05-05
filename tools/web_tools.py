@@ -1129,6 +1129,11 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         # Dispatch to the configured backend
         backend = _get_backend()
+        try:
+            from tools.stealth_io_policy import record_web_query
+            record_web_query(query, backend=backend)
+        except Exception:
+            pass
         if backend == "parallel":
             response_data = _parallel_search(query, limit)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
